@@ -5,6 +5,15 @@
  *
  * 数据文件路径由环境变量 DATA_FILE 指定（默认 ./data/store.json）。
  * 首次启动（文件不存在）时自动写入初始演示数据，实现“启动即初始化”。
+ *
+ * 快照提交机制（所有写操作的唯一入口，见 commit）：
+ * - 每个写请求的全部变更（道具 / 记录 / 签收任意组合）合并为一份完整新快照，
+ *   一次请求只落盘一次、数据版本 rev 只自增一次；
+ * - 提交时先把完整新快照写入临时文件，再原子重命名替换正式文件，
+ *   落盘成功后才切换内存缓存（发布新状态）；
+ * - 任一步落盘失败：缓存、正式数据文件与 rev 全部保持提交前状态，
+ *   临时文件被清理，并抛出 code 为 STORE_WRITE_FAILED 的错误（由服务端转为 JSON 500），
+ *   写入恢复后重试同一请求即可，重启后读取的仍是最后一次成功提交的完整状态。
  */
 
 const fs = require('fs');
@@ -55,6 +64,25 @@ function seedData() {
   return { version: 1, rev: 0, props, records, signoffs: [] };
 }
 
+/**
+ * 把一份完整快照原子写入数据文件：先写临时文件，再原子重命名替换正式文件。
+ * 任一步失败时清理临时文件并抛出 STORE_WRITE_FAILED；
+ * 正式数据文件保持写入前状态（重命名未发生或未完成，旧文件不受影响）。
+ */
+function persistSnapshot(snapshot) {
+  const tmp = `${DATA_FILE}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2), 'utf8');
+    fs.renameSync(tmp, DATA_FILE);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* 临时文件可能尚未创建，忽略清理失败 */ }
+    const wrapped = new Error(`数据写入失败：${err.message}`);
+    wrapped.code = 'STORE_WRITE_FAILED';
+    wrapped.cause = err;
+    throw wrapped;
+  }
+}
+
 function ensureLoaded() {
   if (cache) return cache;
 
@@ -62,8 +90,9 @@ function ensureLoaded() {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   if (!fs.existsSync(DATA_FILE)) {
-    cache = seedData();
-    persist();
+    const seeded = seedData();
+    persistSnapshot(seeded); // 初始化落盘失败同样抛错，不建立缓存
+    cache = seeded;
     console.log(`[store] 数据文件不存在，已初始化演示数据: ${DATA_FILE}`);
   } else {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
@@ -72,7 +101,7 @@ function ensureLoaded() {
       if (!Array.isArray(parsed.props) || !Array.isArray(parsed.records)) {
         throw new Error('数据结构无效：props/records 必须为数组');
       }
-      // 数据版本号：每次落盘自增，批量预演以此核对数据是否在预演后被修改
+      // 数据版本号：每次成功提交自增一次，批量预演以此核对数据是否在预演后被修改
       if (typeof parsed.rev !== 'number') parsed.rev = 0;
       // 签收列表：旧数据文件可能没有该字段，默认为空
       if (!Array.isArray(parsed.signoffs)) parsed.signoffs = [];
@@ -80,45 +109,45 @@ function ensureLoaded() {
     } catch (err) {
       const backup = `${DATA_FILE}.corrupt.${Date.now()}`;
       fs.renameSync(DATA_FILE, backup);
-      cache = seedData();
-      persist();
+      const seeded = seedData();
+      persistSnapshot(seeded);
+      cache = seeded;
       console.warn(`[store] 数据文件损坏（${err.message}），已备份至 ${backup} 并重新初始化`);
     }
   }
   return cache;
 }
 
-function persist() {
-  cache.rev = (typeof cache.rev === 'number' ? cache.rev : 0) + 1;
-  const tmp = `${DATA_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(cache, null, 2), 'utf8');
-  fs.renameSync(tmp, DATA_FILE);
-}
-
 function getData() {
   return ensureLoaded();
 }
 
-function saveProps(props) {
-  cache.props = props;
-  persist();
-}
-
-function saveRecords(records) {
-  cache.records = records;
-  persist();
-}
-
-function saveSignoffs(signoffs) {
-  cache.signoffs = signoffs;
-  persist();
+/**
+ * 快照提交：把一个请求的全部变更整体落盘。
+ *
+ * @param {{props?: Array, records?: Array, signoffs?: Array}} patch
+ *        需要替换的完整新数组；未给出的字段沿用当前值
+ * @returns {object} 已发布的新快照（rev 已自增一次）
+ * @throws {{code: 'STORE_WRITE_FAILED'}} 落盘失败；
+ *         此时缓存、正式数据文件与 rev 均保持提交前状态，临时文件已清理
+ */
+function commit(patch) {
+  const current = ensureLoaded();
+  const next = {
+    version: current.version,
+    rev: (typeof current.rev === 'number' ? current.rev : 0) + 1,
+    props: patch.props !== undefined ? patch.props : current.props,
+    records: patch.records !== undefined ? patch.records : current.records,
+    signoffs: patch.signoffs !== undefined ? patch.signoffs : current.signoffs,
+  };
+  persistSnapshot(next); // 先完整落盘：失败抛错，缓存与 rev 不变
+  cache = next; // 落盘成功后才发布缓存
+  return next;
 }
 
 module.exports = {
   WAREHOUSE,
   newId,
   getData,
-  saveProps,
-  saveRecords,
-  saveSignoffs,
+  commit,
 };

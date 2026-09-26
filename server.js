@@ -193,8 +193,8 @@ app.post('/api/props', asyncRoute((req, res) => {
     note: typeof body.note === 'string' ? body.note.trim() : '',
     createdAt: Date.now(),
   };
-  const props = [...data.props, prop];
-  store.saveProps(props);
+  // 快照提交：一次落盘，rev 只自增一次；落盘失败由错误兜底返回 JSON 500，数据保持原状
+  store.commit({ props: [...data.props, prop] });
   res.status(201).json(prop);
 }));
 
@@ -218,28 +218,28 @@ app.put('/api/props/:id', asyncRoute((req, res) => {
     name,
     note: typeof body.note === 'string' ? body.note.trim() : (data.props[idx].note || ''),
   };
-  const props = data.props.map((p) => (p.id === updated.id ? updated : p));
-  store.saveProps(props);
+  // 快照提交：一次落盘，rev 只自增一次
+  store.commit({ props: data.props.map((p) => (p.id === updated.id ? updated : p)) });
   res.json(updated);
 }));
 
-app.delete('/api/props/:id', (req, res) => {
+app.delete('/api/props/:id', asyncRoute((req, res) => {
   const data = store.getData();
   if (!data.props.some((p) => p.id === req.params.id)) {
     return res.status(404).json({ error: '道具不存在' });
   }
-  // 删除道具时级联删除其全部交接记录
+  // 删除道具时级联删除其全部交接记录，被删记录的签收一并失效：
+  // 三类变更合并为一次快照提交（整体落盘一次、rev 只自增一次），不留部分变更
   const removedRecordIds = new Set(
     data.records.filter((r) => r.propId === req.params.id).map((r) => r.id)
   );
-  const props = data.props.filter((p) => p.id !== req.params.id);
-  const records = data.records.filter((r) => r.propId !== req.params.id);
-  store.saveProps(props);
-  store.saveRecords(records);
-  // 级联删除的记录，其签收一并失效
-  store.saveSignoffs((data.signoffs || []).filter((s) => !removedRecordIds.has(s.recordId)));
+  store.commit({
+    props: data.props.filter((p) => p.id !== req.params.id),
+    records: data.records.filter((r) => r.propId !== req.params.id),
+    signoffs: (data.signoffs || []).filter((s) => !removedRecordIds.has(s.recordId)),
+  });
   res.status(204).end();
-});
+}));
 
 /* ---------------- 交接记录 CRUD ---------------- */
 
@@ -272,7 +272,8 @@ app.post('/api/records', asyncRoute((req, res) => {
     return badRequest(res, err.message);
   }
   const record = { id: store.newId('r'), ...fields, createdAt: Date.now() };
-  store.saveRecords([...data.records, record]);
+  // 快照提交：一次落盘，rev 只自增一次
+  store.commit({ records: [...data.records, record] });
   res.status(201).json(record);
 }));
 
@@ -289,22 +290,26 @@ app.put('/api/records/:id', asyncRoute((req, res) => {
   }
   // 修改保留原始录入顺序（createdAt），使同一分钟仍按最初录入先后重放
   const updated = { ...data.records[idx], ...fields };
-  store.saveRecords(data.records.map((r) => (r.id === updated.id ? updated : r)));
-  // 记录被编辑后，该记录的旧签收立即失效
-  store.saveSignoffs((data.signoffs || []).filter((s) => s.recordId !== updated.id));
+  // 记录被编辑后，该记录的旧签收立即失效：记录变更与签收清理合并为一次快照提交
+  store.commit({
+    records: data.records.map((r) => (r.id === updated.id ? updated : r)),
+    signoffs: (data.signoffs || []).filter((s) => s.recordId !== updated.id),
+  });
   res.json(updated);
 }));
 
-app.delete('/api/records/:id', (req, res) => {
+app.delete('/api/records/:id', asyncRoute((req, res) => {
   const data = store.getData();
   if (!data.records.some((r) => r.id === req.params.id)) {
     return res.status(404).json({ error: '记录不存在' });
   }
-  store.saveRecords(data.records.filter((r) => r.id !== req.params.id));
-  // 记录被删除后，其旧签收立即失效
-  store.saveSignoffs((data.signoffs || []).filter((s) => s.recordId !== req.params.id));
+  // 记录被删除后，其旧签收立即失效：记录删除与签收清理合并为一次快照提交
+  store.commit({
+    records: data.records.filter((r) => r.id !== req.params.id),
+    signoffs: (data.signoffs || []).filter((s) => s.recordId !== req.params.id),
+  });
   res.status(204).end();
-});
+}));
 
 /* ---------------- 交接双方签收（交出者 / 接收者各自确认，状态独立并持久保存） ---------------- */
 
@@ -354,8 +359,9 @@ app.post('/api/records/:id/signoff', asyncRoute((req, res) => {
     // 服务端按当前记录重新计算内容指纹，核对道具、分钟、双方姓名与备注一致，
     // 且签收姓名匹配对应角色后才写入；指纹不符（过期页面）返回 409
     const result = applySignoff(data, req.params.id, side, name, body.recordHash);
-    store.saveSignoffs(result.signoffs);
-    return res.json(signoffResponse(store.getData(), result.record));
+    // 快照提交：签收列表整体一次落盘，rev 只自增一次
+    const committed = store.commit({ signoffs: result.signoffs });
+    return res.json(signoffResponse(committed, result.record));
   } catch (err) {
     if (err.code === 'NOT_FOUND') return res.status(404).json({ error: err.message });
     if (err.code === 'STALE') return res.status(409).json({ error: err.message, stale: true });
@@ -575,13 +581,14 @@ app.post('/api/records/batch/commit', asyncRoute((req, res) => {
     return conflict409(res, '预演结果存在冲突，禁止提交；请调整批次后重新预演');
   }
 
-  // 一次写入全部记录：单次 saveRecords（临时文件 + 原子重命名），不留部分记录
+  // 快照提交：整批记录一次落盘（完整快照写临时文件 + 原子重命名，成功后才发布缓存），
+  // 不留部分记录；落盘失败时 rev 不变，预演票据仍有效，写入恢复后可直接重试提交
   const now = Date.now();
   const newRecords = rows.map((f, i) => ({ id: store.newId('r'), ...f, createdAt: now + i }));
-  store.saveRecords([...data.records, ...newRecords]);
+  const committed = store.commit({ records: [...data.records, ...newRecords] });
   previews.delete(String(body.previewId));
 
-  res.status(201).json({ inserted: newRecords.length, records: newRecords, rev: store.getData().rev });
+  res.status(201).json({ inserted: newRecords.length, records: newRecords, rev: committed.rev });
 }));
 
 /* ---------------- 交接冲突修复预演（只读，枚举单条记录改动，不改写交接记录） ---------------- */
@@ -662,6 +669,12 @@ app.post('/api/change-impact/preview', asyncRoute((req, res) => {
 /* ---------------- 错误兜底 ---------------- */
 
 app.use((err, req, res, next) => {
+  // 落盘失败：缓存、正式数据文件与 rev 均保持请求前状态（临时文件已清理），
+  // 本次变更未保存，写入恢复后重试同一请求即可
+  if (err && err.code === 'STORE_WRITE_FAILED') {
+    console.error('[store] 数据落盘失败，本次变更未保存：', err.cause || err);
+    return res.status(500).json({ error: '数据写入失败，本次变更未保存，请稍后重试' });
+  }
   console.error('[error]', err);
   res.status(500).json({ error: '服务器内部错误' });
 });
